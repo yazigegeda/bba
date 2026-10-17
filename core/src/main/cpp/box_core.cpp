@@ -1,14 +1,10 @@
-
-
-
-
 #include "box_core.h"
 #include "log.h"
 #include "io.h"
+#include "sandhook_jni.h"
 #include <jni.h>
 #include <stdint.h>
 #include <jnihook/jni_hook.h>
-#include <hook/vm_class_loader_hook.h>
 #include <hook/unix_file_system_hook.h>
 #include <hook/file_system_hook.h>
 #include <hook/binder_hook.h>
@@ -19,6 +15,7 @@
 #include <hook/spindle_server.h>
 #include "utils/hex_dump.h"
 #include "hidden_api.h"
+#include "hook/seccomp_io.h"
 
 #include <pthread.h>
 #include <cstdlib>
@@ -32,8 +29,6 @@ struct {
     jmethodID getCallingUidId;
     jmethodID redirectPathString;
     jmethodID redirectPathFile;
-    jmethodID loadEmptyDex;
-    jmethodID loadEmptyDexL;
     int api_level;
 } VMEnv;
 
@@ -131,11 +126,6 @@ jstring BoxCore::redirectPathString(JNIEnv *env, jstring path) {
 jobject BoxCore::redirectPathFile(JNIEnv *env, jobject path) {
     env = ensureEnvCreated();
     return env->CallStaticObjectMethod(VMEnv.NativeCoreClass, VMEnv.redirectPathFile, path);
-}
-
-jlongArray BoxCore::loadEmptyDex(JNIEnv *env) {
-    env = ensureEnvCreated();
-    return (jlongArray) env->CallStaticObjectMethod(VMEnv.NativeCoreClass, VMEnv.loadEmptyDex);
 }
 
 int BoxCore::getApiLevel() {
@@ -267,16 +257,10 @@ void nativeHook(JNIEnv *env) {
     BaseHook::init(env);
     UnixFileSystemHook::init(env);
     FileSystemHook::init();
-    VMClassLoaderHook::init(env);
 
     BinderHook::init(env);
     DexFileHook::init(env);
     ZlibHook::init(env);
-}
-
-void hideXposed(JNIEnv *env, jclass clazz) {
-    ALOGD("set hideXposed");
-    VMClassLoaderHook::hideXposed();
 }
 
 void init(JNIEnv *env, jobject clazz, jint api_level) {
@@ -288,32 +272,59 @@ void init(JNIEnv *env, jobject clazz, jint api_level) {
                                                       "(Ljava/lang/String;)Ljava/lang/String;");
     VMEnv.redirectPathFile = env->GetStaticMethodID(VMEnv.NativeCoreClass, "redirectPath",
                                                     "(Ljava/io/File;)Ljava/io/File;");
-    VMEnv.loadEmptyDex = env->GetStaticMethodID(VMEnv.NativeCoreClass, "loadEmptyDex",
-                                                "()[J");
 
     JniHook::InitJniHook(env, api_level);
 }
 
-void addIORule(JNIEnv *env, jclass clazz, jstring target_path,
-               jstring relocate_path) {
-    ALOGD("set addIORule");
-    IO::addRule(env->GetStringUTFChars(target_path, JNI_FALSE),
-                env->GetStringUTFChars(relocate_path, JNI_FALSE));
-}
-
-void enableIO(JNIEnv *env, jclass clazz) {
-    ALOGD("set enableIO");
+void setupIO(JNIEnv *env, jclass clazz, jobject rules) {
+    ALOGD("set setupIO");
+    (void) clazz;
+    if (rules != nullptr) {
+        jclass mapClass = env->GetObjectClass(rules);
+        jmethodID entrySet = env->GetMethodID(mapClass, "entrySet", "()Ljava/util/Set;");
+        jobject set = env->CallObjectMethod(rules, entrySet);
+        if (set != nullptr) {
+            jclass setClass = env->GetObjectClass(set);
+            jmethodID iterator = env->GetMethodID(setClass, "iterator", "()Ljava/util/Iterator;");
+            jobject it = env->CallObjectMethod(set, iterator);
+            if (it != nullptr) {
+                jclass itClass = env->GetObjectClass(it);
+                jmethodID hasNext = env->GetMethodID(itClass, "hasNext", "()Z");
+                jmethodID next = env->GetMethodID(itClass, "next", "()Ljava/lang/Object;");
+                jclass entryClass = env->FindClass("java/util/Map$Entry");
+                jmethodID getKey = env->GetMethodID(entryClass, "getKey", "()Ljava/lang/Object;");
+                jmethodID getValue = env->GetMethodID(entryClass, "getValue", "()Ljava/lang/Object;");
+                while (env->CallBooleanMethod(it, hasNext)) {
+                    jobject entry = env->CallObjectMethod(it, next);
+                    if (entry == nullptr) {
+                        continue;
+                    }
+                    auto key = (jstring) env->CallObjectMethod(entry, getKey);
+                    auto value = (jstring) env->CallObjectMethod(entry, getValue);
+                    if (key != nullptr && value != nullptr) {
+                        const char *from = env->GetStringUTFChars(key, nullptr);
+                        const char *to = env->GetStringUTFChars(value, nullptr);
+                        if (from != nullptr && to != nullptr) {
+                            IO::addRule(from, to);
+                        }
+                        if (from != nullptr) env->ReleaseStringUTFChars(key, from);
+                        if (to != nullptr) env->ReleaseStringUTFChars(value, to);
+                    }
+                    if (key != nullptr) env->DeleteLocalRef(key);
+                    if (value != nullptr) env->DeleteLocalRef(value);
+                    env->DeleteLocalRef(entry);
+                }
+                env->DeleteLocalRef(entryClass);
+                env->DeleteLocalRef(itClass);
+                env->DeleteLocalRef(it);
+            }
+            env->DeleteLocalRef(setClass);
+            env->DeleteLocalRef(set);
+        }
+        env->DeleteLocalRef(mapClass);
+    }
     IO::init(env);
     nativeHook(env);
-}
-
-bool disableHiddenApi(JNIEnv *env, jclass clazz) {
-    ALOGD("set disableHiddenApi");
-    if(!disable_hidden_api(env)){
-        ALOGD("set disableHiddenApi Fail!!!");
-        return false;
-    }
-    return true;
 }
 
 bool disableResourceLoading(JNIEnv *env, jclass clazz) {
@@ -323,6 +334,13 @@ bool disableResourceLoading(JNIEnv *env, jclass clazz) {
         return false;
     }
     return true;
+}
+
+jboolean enableSeccompIo(JNIEnv *env, jclass clazz) {
+    (void) env;
+    (void) clazz;
+    ALOGD("set enableSeccompIo");
+    return SeccompIo_install() ? JNI_TRUE : JNI_FALSE;
 }
 
 jlong gumReplace(JNIEnv *env, jclass clazz, jlong target, jlong replacement) {
@@ -468,11 +486,9 @@ void spindleHostLog(JNIEnv *env, jclass clazz, jint pid, jstring text) {
 }
 
 static JNINativeMethod gMethods[] = {
-        {"disableHiddenApi", "()Z",                               (void *) disableHiddenApi},
         {"disableResourceLoading", "()Z",                         (void *) disableResourceLoading},
-        {"hideXposed", "()V",                                     (void *) hideXposed},
-        {"addIORule",  "(Ljava/lang/String;Ljava/lang/String;)V", (void *) addIORule},
-        {"enableIO",   "()V",                                     (void *) enableIO},
+        {"enableSeccompIo", "()Z",                                (void *) enableSeccompIo},
+        {"setupIO",    "(Ljava/util/Map;)V",                      (void *) setupIO},
         {"init",       "(I)V",                                    (void *) init},
         {"gumReplace", "(JJ)J",                                   (void *) gumReplace},
         {"gumRevert", "(J)V",                                     (void *) gumRevert},
@@ -519,5 +535,18 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
         return JNI_EVERSION;
     }
     registerMethod(env);
+    // beer is statically linked; register its JNI natives from this .so.
+    jclass sandHook = env->FindClass("com/android/lppi/SandHook");
+    jclass neverCall = env->FindClass("com/android/lppi/ClassNeverCall");
+    if (sandHook != nullptr && neverCall != nullptr) {
+        if (!JNI_Load_Ex(env, sandHook, neverCall)) {
+            ALOGE("SandHook JNI_Load_Ex failed");
+        }
+    } else {
+        env->ExceptionClear();
+        ALOGE("SandHook classes not found for JNI registration");
+    }
+    if (sandHook != nullptr) env->DeleteLocalRef(sandHook);
+    if (neverCall != nullptr) env->DeleteLocalRef(neverCall);
     return JNI_VERSION_1_6;
 }

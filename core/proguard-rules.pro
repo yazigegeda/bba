@@ -22,6 +22,7 @@
 
 -keep class com.android.bb.** {*; }
 -keep class com.android.jnihook.** {*; }
+-keep class com.android.lppi.** { *; }
 -keep class mirror.** {*; }
 -keep class android.** {*; }
 -keep class com.android.** {*; }

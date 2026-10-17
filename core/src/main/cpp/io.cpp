@@ -5,6 +5,9 @@
 #include "io.h"
 #include "log.h"
 
+#include <cstring>
+#include <cstdlib>
+
 jmethodID getAbsolutePathMethodId;
 
 list<IO::RelocateInfo> relocate_rule;
@@ -74,7 +77,9 @@ const char *IO::redirectPath(const char *__path) {
     list<IO::RelocateInfo>::iterator iterator;
     for (iterator = relocate_rule.begin(); iterator != relocate_rule.end(); ++iterator) {
         IO::RelocateInfo info = *iterator;
-        if (strstr(__path, info.targetPath) && !strstr(__path, "/blackbox/")) {
+        if (strstr(__path, info.targetPath)
+                && !strstr(__path, "/v0/")
+                && !strstr(__path, "/blackbox/")) {
             char *ret = replace(__path, info.targetPath, info.relocatePath);
             
             return ret;
@@ -103,8 +108,8 @@ jobject IO::redirectPath(JNIEnv *env, jobject path) {
 
 void IO::addRule(const char *targetPath, const char *relocatePath) {
     IO::RelocateInfo info{};
-    info.targetPath = targetPath;
-    info.relocatePath = relocatePath;
+    info.targetPath = strdup(targetPath);
+    info.relocatePath = strdup(relocatePath);
     relocate_rule.push_back(info);
 }
 
